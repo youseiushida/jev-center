@@ -1,0 +1,23 @@
+# 認証情報
+.env
+*.env
+
+# 評価データ（各自ダウンロード。研究目的のみ・再配布不可）
+center-finaltest/
+torobo-data/
+
+# 実行結果（問題本文を含むため公開しない。集計だけ残す）
+results/*
+!results/jev_sections.summary.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
