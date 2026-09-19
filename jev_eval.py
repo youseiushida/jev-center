@@ -1103,6 +1103,7 @@ def main() -> None:
         print(f"既存の結果 {len(done)} 大問を読み込みました（再開モード）")
 
     started = time.perf_counter()
+    requests_this_run = 0
     if args.simulate:
         for row in simulate_rows(sections):
             done[row["key"]] = row
@@ -1121,6 +1122,7 @@ def main() -> None:
                 }
                 for i, future in enumerate(as_completed(futures), 1):
                     row = future.result()
+                    requests_this_run += row.get("n_requests") or 0
                     done[row["key"]] = row
                     fh.write(json.dumps(row, ensure_ascii=False) + "\n")
                     fh.flush()
@@ -1139,7 +1141,19 @@ def main() -> None:
         else None
     )
     summary = summarize(rows, official, exam_meta)
-    summary["wall_clock_s"] = time.perf_counter() - started
+    elapsed_this_run = time.perf_counter() - started
+    summary["n_requests_this_run"] = requests_this_run
+    # リクエストを 1 つも出さなかった再集計では、前回の実行時間をそのまま残す
+    summary_path = out_path.with_suffix(".summary.json")
+    previous_wall = None
+    if summary_path.exists():
+        try:
+            previous_wall = json.loads(summary_path.read_text(encoding="utf-8-sig")).get("wall_clock_s")
+        except (json.JSONDecodeError, OSError):
+            previous_wall = None
+    summary["wall_clock_s"] = elapsed_this_run if (requests_this_run or previous_wall is None) else previous_wall
+    # リクエストの所要時間の合計（直列換算）。並列度に関係なく比較できる
+    summary["total_request_seconds"] = sum(r.get("elapsed") or 0.0 for r in rows)
     summary["settings"] = {
         "split": args.split,
         "subjects": sorted(subjects) if subjects else "all",

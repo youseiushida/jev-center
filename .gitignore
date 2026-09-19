@@ -8,6 +8,7 @@ torobo-data/
 
 # 実行結果（問題本文を含むため公開しない。集計だけ残す）
 results/*
+!results/jev_sections.jsonl
 !results/jev_sections.summary.json
 
 # Python
