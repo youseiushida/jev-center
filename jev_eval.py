@@ -84,6 +84,8 @@ SPLITS: dict[str, tuple[Path, Path | None]] = {
 MARK_DIGIT = {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "0": 10}
 POINTS_RE = re.compile(r"配点[^0-9]{0,6}([0-9]+)")
 IMG_SOLVABLE_HINTS = ("見なくても", "見ずに")
+# 音声が必要な問題（英語リスニング）。ファイル名か subject 属性で判定する。
+AUDIO_HINT = "listening"
 # 全データ実行時の実測値（17,215問 / $0.3158）。--dry-run の概算に使う。
 COST_PER_QUESTION_USD = 0.0000183
 
@@ -126,6 +128,12 @@ def image_srcs(el: ET.Element) -> list[str]:
 def image_hints(el: ET.Element) -> list[str]:
     """「画像を見なくても解ける」等の注記（<img comment="...">）を集める。"""
     return [(im.get("comment") or "").strip() for im in el.iter("img") if im.get("comment")]
+
+
+def needs_audio(*names: str) -> bool:
+    """音声が必要な問題かどうか。英語リスニングのファイル名 / subject 属性で判定する。
+    音声そのものは配布データに含まれていないので、これは「入力が欠けている問題」の印。"""
+    return any(AUDIO_HINT in (name or "").lower() for name in names)
 
 
 def lead_parts(el: ET.Element) -> tuple[str, list[str], list[str]]:
@@ -240,6 +248,7 @@ class Section:
     state: str
     declared_points: float | None
     has_image: bool
+    has_audio: bool
     missing_images: list[str]
     questions: list[Question]
 
@@ -402,11 +411,13 @@ def _load_split(
             print(f"  [skip] {path.name}: {exc}", file=sys.stderr)
             continue
         tops = [c for c in root if c.tag == "question"]
+        file_has_audio = needs_audio(path.name, root.get("subject"))
         exam_meta[path.name] = {
             "subject": subject,
             "paper": paper,
             "year": year,
             "exam": exam,
+            "has_audio": file_has_audio,
             # 正解が分からない小問も含めた「試験全体の満点と問題数」
             "exam_points": sum(declared_points(lead_parts(t)[0]) or 0 for t in tops),
             "n_questions": len([q for q in root.iter("question") if q.findall("./choices/choice")]),
@@ -434,6 +445,7 @@ def _load_split(
                 state=state,
                 declared_points=declared_points(lead),
                 has_image=bool(lead_srcs) or any(q.has_image for q in questions),
+                has_audio=file_has_audio,
                 missing_images=sorted({s for s in lead_srcs if not (path.parent / s).exists()}),
                 questions=questions,
             )
@@ -598,6 +610,7 @@ def section_row(
         "state": section.state,
         "declared_points": section.declared_points,
         "has_image": section.has_image,
+        "has_audio": section.has_audio,
         "missing_images": section.missing_images,
         "elapsed": elapsed,
         "cost": cost,
@@ -697,6 +710,8 @@ def flatten(rows: list[dict]) -> list[dict]:
                 "exam": row["exam"],
                 "key": f"{row['key']}:{q['qid']}",
                 "error": q.get("error") or sec_error,
+                # 既存の結果ファイルには has_audio が無いので、ファイル名から補う
+                "has_audio": bool(row.get("has_audio")) or needs_audio(row.get("file") or ""),
             })
     return q_rows
 
@@ -722,6 +737,11 @@ def top_margin(question: dict) -> float | None:
     except (TypeError, ValueError):
         return None
     return values[0] - values[1]
+
+
+def no_media(question: dict) -> bool:
+    """図も音声も参照していない問題かどうか。JEV に欠けている入力を必要としない問題。"""
+    return not question.get("has_image") and not question.get("has_audio")
 
 
 def confidence_stats(qs: list[dict]) -> dict:
@@ -842,14 +862,14 @@ def summarize(rows: list[dict], official: dict | None = None, exam_meta: dict[st
         "by_subject": {
             s: {
                 **block([q for q in q_rows if q["subject"] == s], [r for r in sec_rows if r["subject"] == s]),
-                # 科目ごとの 図なし / 図あり の内訳（README の表はこれを使う）
-                "text_only": q_block(
-                    ok_qs([q for q in q_rows if q["subject"] == s and not q["has_image"]]),
-                    [r for r in sec_rows if r["subject"] == s and not r["has_image"]],
+                # 科目ごとの「図・音声なし / あり」の内訳（README の表はこれを使う）
+                "no_media": q_block(
+                    ok_qs([q for q in q_rows if q["subject"] == s and no_media(q)]),
+                    [r for r in sec_rows if r["subject"] == s and not (r["has_image"] or r.get("has_audio"))],
                 ),
-                "image_required": q_block(
-                    ok_qs([q for q in q_rows if q["subject"] == s and q["has_image"]]),
-                    [r for r in sec_rows if r["subject"] == s and r["has_image"]],
+                "with_media": q_block(
+                    ok_qs([q for q in q_rows if q["subject"] == s and not no_media(q)]),
+                    [r for r in sec_rows if r["subject"] == s and (r["has_image"] or r.get("has_audio"))],
                 ),
             }
             for s in subjects
@@ -858,9 +878,14 @@ def summarize(rows: list[dict], official: dict | None = None, exam_meta: dict[st
             e: block([q for q in q_rows if q["exam"] == e], [r for r in sec_rows if r["exam"] == e])
             for e in sorted({r["exam"] for r in rows})
         },
-        "by_image": {
-            "text_only": q_block(ok_qs([q for q in q_rows if not q["has_image"]]), [r for r in sec_rows if not r["has_image"]]),
-            "image_required": q_block(ok_qs([q for q in q_rows if q["has_image"]]), [r for r in sec_rows if r["has_image"]]),
+        "by_modality": {
+            "no_media": q_block(ok_qs([q for q in q_rows if no_media(q)]),
+                                [r for r in sec_rows if not (r["has_image"] or r.get("has_audio"))]),
+            "with_media": q_block(ok_qs([q for q in q_rows if not no_media(q)]),
+                                  [r for r in sec_rows if (r["has_image"] or r.get("has_audio"))]),
+            "image_only": q_block(ok_qs([q for q in q_rows if q["has_image"] and not q["has_audio"]]), []),
+            "audio_only": q_block(ok_qs([q for q in q_rows if q["has_audio"] and not q["has_image"]]), []),
+            "image_and_audio": q_block(ok_qs([q for q in q_rows if q["has_image"] and q["has_audio"]]), []),
             "image_annotated_solvable": q_block(
                 ok_qs([q for q in q_rows if q["image_solvable"]]),
                 [r for r in sec_rows if any(q["image_solvable"] for q in r["questions"])],
@@ -869,8 +894,8 @@ def summarize(rows: list[dict], official: dict | None = None, exam_meta: dict[st
         "confidence": {
             "all": confidence_stats(ok_qs(q_rows)),
             "correct_only": confidence_stats([q for q in ok_qs(q_rows) if q["correct"]]),
-            "text_only": confidence_stats(ok_qs([q for q in q_rows if not q["has_image"]])),
-            "image_required": confidence_stats(ok_qs([q for q in q_rows if q["has_image"]])),
+            "no_media": confidence_stats(ok_qs([q for q in q_rows if no_media(q)])),
+            "with_media": confidence_stats(ok_qs([q for q in q_rows if not no_media(q)])),
             # probabilities の argmax と API の choice が食い違った件数
             "argmax_mismatch": sum(
                 1 for q in ok_qs(q_rows) if q.get("choice") and q.get("pred") and q["choice"] != q["pred"]
@@ -892,8 +917,8 @@ def print_summary(summary: dict) -> None:
             f"${stats['total_cost_usd']:.4f}  in {stats['input_tokens']} out {stats['output_tokens']}"
         )
 
-    print("\n== 図の有無で比較 ==")
-    for title, stats in summary["by_image"].items():
+    print("\n== 図・音声の有無で比較 ==")
+    for title, stats in summary["by_modality"].items():
         if not stats["n"]:
             continue
         print(
@@ -960,10 +985,10 @@ def print_summary(summary: dict) -> None:
         if c_ok.get("median_ratio") is not None:
             print(f"  正解のみ 中央値 {c_ok['median_ratio']:.2f} / 正解確率と誤答の差の中央値 {c_ok['median_margin']:.3f}")
         print(f"  正解確率の中央値 {c_all['median_p_correct']:.3f}")
-        for title in ("text_only", "image_required"):
+        for title in ("no_media", "with_media"):
             c = conf.get(title) or {}
             if c.get("median_ratio") is not None:
-                print(f"  {title:<24}中央値 {c['median_ratio']:.2f} / 正解確率の中央値 {c['median_p_correct']:.3f}")
+                print(f"  {title:<12}中央値 {c['median_ratio']:.2f} / 正解確率の中央値 {c['median_p_correct']:.3f}")
         print("  1位と2位の確率差ごとの実際の正解率:")
         for row in c_all["calibration"]:
             if row["n"]:
@@ -1006,6 +1031,7 @@ def simulate_rows(sections: list[Section], accuracy: float = 0.88) -> list[dict]
             "year": section.year, "exam": section.exam,
             "file": section.file, "sid": section.sid, "label": section.label, "state": section.state,
             "declared_points": section.declared_points, "has_image": section.has_image,
+            "has_audio": section.has_audio,
             "missing_images": section.missing_images, "elapsed": 0.8,
             "cost": 0.00004 * len(questions), "input_tokens": 800 * len(questions),
             "output_tokens": 30 * len(questions), "n_requests": 1, "error": None,
@@ -1030,7 +1056,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, help="評価する大問数（ランダム抽出）")
     parser.add_argument("--seed", type=int, default=0, help="--limit の抽出シード")
     parser.add_argument("--workers", type=int, default=4, help="並列リクエスト数")
-    parser.add_argument("--text-only", action="store_true", help="図を参照する問題を除く")
+    parser.add_argument("--text-only", action="store_true", help="図や音声を参照する小問を除く")
     parser.add_argument("--per-question", action="store_true", help="大問バッチではなく1問1リクエストで送る")
     parser.add_argument("--answers", default="auto", choices=["auto", "xml", "table"],
                         help="正解の取得元。auto=問題XMLの ra と正答データの両方")
@@ -1051,10 +1077,10 @@ def main() -> None:
 
     sections, exam_meta = load_sections(args.split, subjects, years, use_xml, use_table)
     if args.text_only:
-        # 図を参照する「小問」だけを外す。大問のリード文に図があっても、
-        # 図を見ずに解ける小問は残したいため、大問単位では切らない。
+        # 図や音声を参照する「小問」だけを外す。大問のリード文に図があっても、
+        # それを見ずに解ける小問は残したいため、大問単位では切らない。
         for s in sections:
-            s.questions = [q for q in s.questions if not q.has_image]
+            s.questions = [q for q in s.questions if not q.has_image and not s.has_audio]
         sections = [s for s in sections if s.questions]
     if args.limit and args.limit < len(sections):
         sections = random.Random(args.seed).sample(sections, args.limit)
